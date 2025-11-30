@@ -1,0 +1,210 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build Docker Image
+        run: |
+          IMAGE_URI="${{ secrets.IMAGE_URI }}"
+          IMAGE_TAG="${{ github.run_number }}"
+          docker build -t $IMAGE_URI:$IMAGE_TAG .
+
+      - name: Scan local image with Trivy
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: "${{ secrets.IMAGE_URI}}:${{ github.run_number }}"
+          format: 'table'
+          exit-code: '0'
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+
+      - name: Push Docker Image to ECR
+        run: |
+          IMAGE_URI="${{ secrets.IMAGE_URI }}"
+          IMAGE_TAG="${{ github.run_number }}"
+          docker push $IMAGE_URI:$IMAGE_TAG
+          docker tag $IMAGE_URI:$IMAGE_TAG $IMAGE_URI:latest
+          docker push $IMAGE_URI:latest
+
+  deploy:
+    needs: build-and-scan
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Fill in the new image ID in the ECS task definition
+        run: |
+          IMAGE_URI="${{ secrets.IMAGE_URI }}"
+          IMAGE_TAG="${{ github.run_number }}"
+          sed -i "s|<IMAGE_URI>:<TAG>|$IMAGE_URI:$IMAGE_TAG|" ecs-taskdef.json
+
+      - name: Ensure ECS cluster exists
+        run: |
+          CLUSTER_NAME="${{ vars.ECS_CLUSTER }}"
+          CLUSTER_STATUS=$(aws ecs describe-clusters \
+            --clusters "$CLUSTER_NAME" \
+            --query "clusters[0].status" \
+            --output text 2>/dev/null || echo "None")
+
+          if [ "$CLUSTER_STATUS" == "None" ] || [ "$CLUSTER_STATUS" == "INACTIVE" ]; then
+            echo "Cluster does not exist or is inactive. Creating cluster..."
+            aws ecs create-cluster --cluster-name "$CLUSTER_NAME"
+          else
+            echo "Cluster already active. Skipping creation."
+          fi
+
+      - name: Register ECS task definition
+        run: |
+          TASK_DEF_JSON="ecs-taskdef.json"
+          REGISTERED_TASK=$(aws ecs register-task-definition \
+            --cli-input-json file://$TASK_DEF_JSON \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+          echo "REGISTERED_TASK=$REGISTERED_TASK" >> $GITHUB_ENV
+          echo "Registered task definition: $REGISTERED_TASK"
+
+      - name: Ensure ALB exists
+        run: |
+          ALB_NAME="my-app-alb"
+          SUBNETS="subnet-012c6dbdfd7a7d6ae subnet-04d36462c4a91be64"
+
+          ALB_ARN=$(aws elbv2 describe-load-balancers \
+            --names "$ALB_NAME" \
+            --query "LoadBalancers[0].LoadBalancerArn" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$ALB_ARN" ]; then
+            echo "Creating ALB..."
+            ALB_ARN=$(aws elbv2 create-load-balancer \
+              --name "$ALB_NAME" \
+              --subnets $SUBNETS \
+              --security-groups sg-0a4a620052ab02e74 \
+              --scheme internet-facing \
+              --type application \
+              --query "LoadBalancers[0].LoadBalancerArn" \
+              --output text)
+          fi
+          echo "ALB_ARN=$ALB_ARN" >> $GITHUB_ENV
+
+      - name: Ensure Target Group exists (port 5001)
+        run: |
+          TG_NAME="my-app-tg"
+          PORT=5001
+          VPC_ID=$(aws ec2 describe-subnets \
+            --subnet-ids subnet-012c6dbdfd7a7d6ae subnet-04d36462c4a91be64 \
+            --query "Subnets[0].VpcId" \
+            --output text)
+
+          TG_ARN=$(aws elbv2 describe-target-groups \
+            --names "$TG_NAME" \
+            --query "TargetGroups[0].TargetGroupArn" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$TG_ARN" ]; then
+            echo "Creating Target Group..."
+            TG_ARN=$(aws elbv2 create-target-group \
+              --name "$TG_NAME" \
+              --protocol HTTP \
+              --port $PORT \
+              --vpc-id "$VPC_ID" \
+              --health-check-protocol HTTP \
+              --health-check-port $PORT \
+              --health-check-path / \
+              --target-type ip \
+              --query "TargetGroups[0].TargetGroupArn" \
+              --output text)
+          else
+            aws elbv2 modify-target-group \
+              --target-group-arn "$TG_ARN" \
+              --health-check-port $PORT \
+              --health-check-protocol HTTP \
+              --health-check-path /
+          fi
+          echo "TG_ARN=$TG_ARN" >> $GITHUB_ENV
+
+      - name: Ensure Listener exists (ALB port 80)
+        run: |
+          LISTENER=$(aws elbv2 describe-listeners \
+            --load-balancer-arn "$ALB_ARN" \
+            --query 'Listeners[?Port==`80`].ListenerArn' \
+            --output text)
+
+          if [ -z "$LISTENER" ]; then
+            echo "Creating Listener on port 80..."
+            aws elbv2 create-listener \
+              --load-balancer-arn "$ALB_ARN" \
+              --protocol HTTP \
+              --port 80 \
+              --default-actions Type=forward,TargetGroupArn="$TG_ARN"
+          fi
+
+      - name: Ensure ECS service exists or update to 2 tasks
+        run: |
+          CLUSTER_NAME="${{ vars.ECS_CLUSTER }}"
+          SERVICE_NAME="${{ vars.ECS_SERVICE }}"
+          SERVICE_EXISTS=$(aws ecs describe-services \
+            --cluster "$CLUSTER_NAME" \
+            --services "$SERVICE_NAME" \
+            --query "services[0].status" \
+            --output text)
+
+          if [ "$SERVICE_EXISTS" == "None" ] || [ -z "$SERVICE_EXISTS" ]; then
+            echo "Service does not exist. Creating service with 2 tasks..."
+            aws ecs create-service \
+              --cluster "$CLUSTER_NAME" \
+              --service-name "$SERVICE_NAME" \
+              --task-definition "$REGISTERED_TASK" \
+              --desired-count 2 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[subnet-012c6dbdfd7a7d6ae,subnet-04d36462c4a91be64],securityGroups=[sg-0a4a620052ab02e74],assignPublicIp=ENABLED}" \
+              --load-balancers "targetGroupArn=$TG_ARN,containerName=resume,containerPort=5001" \
+              --deployment-controller type=ECS
+          else
+            echo "Service exists. Updating desired count to 2 tasks..."
+            aws ecs update-service \
+              --cluster "$CLUSTER_NAME" \
+              --service "$SERVICE_NAME" \
+              --task-definition "$REGISTERED_TASK" \
+              --desired-count 2
+          fi
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ecs-taskdef.json
+          service: ${{ vars.ECS_SERVICE }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          wait-for-service-stability: false
