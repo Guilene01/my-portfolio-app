@@ -1,0 +1,36 @@
+# Local .terraform directories
+**/.terraform/*
+.terraform/
+
+# Terragrunt cache
+.terragrunt-cache/
+
+# Terraform state files
+*.tfstate
+*.tfstate.*
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Exclude sensitive variable files
+terraform.tfvars
+*.tfvars
+*.tfvars.json
+
+# Override files (usually local)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Plan files
+*.plan
+terraform.tfplan
+
+# Provider plugin lock file
+.terraform.lock.hcl
+
+# Local environment files
+.env
+*.env
