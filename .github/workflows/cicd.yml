@@ -80,7 +80,7 @@ jobs:
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
           task-definition: ecs-taskdef.json
-          container-name: app
+          container-name: resume
           image: ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
 
       # ----------------------
