@@ -37,7 +37,7 @@ jobs:
           pip install pytest
 
       - name: Run pytest
-        run: pytest || true  # Continue even if tests fail
+        run: pytest || true  
 
       # ----------------------
       # Configure AWS
