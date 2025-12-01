@@ -79,7 +79,7 @@ jobs:
         id: taskdef
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          task-definition: ..workflows/.github/ecs-taskdef.json
+          task-definition: ecs-taskdef.json
           container-name: app
           image: ${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
 
